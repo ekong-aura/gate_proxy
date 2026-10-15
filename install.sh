@@ -6,7 +6,9 @@ SOCKS5_PORT="10808"
 SS_PORT="10809"
 
 SOCKS5_USER="admin"
+# 为 SOCKS5 随机生成 12 位密码
 SOCKS5_PASS=$(head -c 32 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 12)
+# 为 Shadowsocks 随机生成 16 位高强度密码
 SS_PASS=$(head -c 32 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 16)
 # ==========================================================
 
@@ -17,26 +19,34 @@ echo -e "\033[36m========================================================\033[0m
 echo -e "\033[32m[1/6] 正在配置系统源并安装基础组件与 Docker 环境...\033[0m"
 export DEBIAN_FRONTEND=noninteractive
 
-# 修复 Ubuntu 24.04 社区源，确保 python3-flask 存在
+# 修复 Ubuntu 24.04 / Debian 软件源，确保包含 python3-flask
 apt-get install -y software-properties-common >/dev/null 2>&1 || true
 add-apt-repository -y universe >/dev/null 2>&1 || true
 
-# 解除可能的后台锁并强制更新安装
+# 解除可能的后台锁
 killall apt apt-get 2>/dev/null || true
 rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || true
 dpkg --configure -a >/dev/null 2>&1 || true
 
 apt-get update -y
-apt-get install -y openvpn python3 python3-flask python3-requests docker.io curl iproute2 iptables
 
-systemctl enable --now docker >/dev/null 2>&1 || true
+# 优先安装核心组件，避免包冲突阻断后续步骤
+apt-get install -y openvpn python3 python3-flask python3-requests curl iproute2 iptables
+
+# 智能识别 Docker：系统未安装时才安装 docker.io，避免与已有 containerd.io 冲突
+if ! command -v docker &> /dev/null; then
+    echo -e "\033[33m系统未检测到 Docker，正在自动安装...\033[0m"
+    apt-get install -y docker.io || true
+fi
+
+systemctl enable --now docker >/dev/null 2>&1 || systemctl restart docker >/dev/null 2>&1 || true
 
 echo -e "\033[32m[2/6] 配置策略路由与守护规则 (/opt/up.sh)...\033[0m"
 cat << 'EOF_UP' > /opt/up.sh
 #!/bin/bash
 ip route flush table 100 2>/dev/null || true
 while ip rule del table 100 2>/dev/null; do :; done
-ip route replace default via $route_vpn_gateway dev $dev table 100
+ip route replace default via $route_vpn_gateway dev$dev table 100
 ip rule add from $ifconfig_local table 100
 docker restart vpngate-proxy >/dev/null 2>&1 &
 exit 0
@@ -428,6 +438,7 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
 EOF_PY
 
+# 注册为 systemd 系统守护进程，开机自启
 cat << 'EOF_SERVICE' > /etc/systemd/system/vpngate.service
 [Unit]
 Description=VPN Gate Panel and Watchdog
@@ -453,13 +464,16 @@ iptables -I INPUT -p tcp --dport ${PANEL_PORT} -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p tcp --dport ${SOCKS5_PORT} -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p tcp --dport ${SS_PORT} -j ACCEPT 2>/dev/null || true
 
+# 获取公网 IP
 SERVER_IP=$(curl -s4 https://api.ipify.org || curl -s4 https://ip.sb || curl -s4 https://ifconfig.me || echo "你的VPS公网IP")
 
+# 生成 Shadowsocks 的标准 Base64 链接
 SS_RAW="aes-256-gcm:${SS_PASS}"
 SS_BASE64=$(echo -n "${SS_RAW}" | base64 | tr -d '\n')
 SS_LINK="ss://${SS_BASE64}@${SERVER_IP}:${SS_PORT}#VPN-Gate家宽落地"
 SOCKS5_LINK="socks5://${SOCKS5_USER}:${SOCKS5_PASS}@${SERVER_IP}:${SOCKS5_PORT}#VPN-Gate家宽落地"
 
+# 将配置留底保存至本地文件
 cat << EOF_INFO > /opt/vpngate_info.txt
 ========================================================
            VPN Gate 家宽落地节点信息清单
@@ -481,6 +495,7 @@ cat << EOF_INFO > /opt/vpngate_info.txt
 ========================================================
 EOF_INFO
 
+# 输出控制台提示与话术
 echo -e "\n\033[32m========================================================================\033[0m"
 echo -e "\033[32m🎉 恭喜！VPN Gate 家宽落地代理及可视化控制面板已成功部署！\033[0m"
 echo -e "\033[32m========================================================================\033[0m"
@@ -491,7 +506,7 @@ echo -e "\033[33m---------------------------------------------------------------
 echo -e "📦 \033[1;33m协议一：SOCKS5 代理（专用于软路由链式代理）\033[0m"
 echo -e "------------------------------------------------------------------------"
 echo -e "🔗 节点链接: \033[33m${SOCKS5_LINK}\033[0m"
-echo -e "   [账密明细] 账号: ${SOCKS5_USER} | 密码: ${SOCKS5_PASS} | 端口: ${SOCKS5_PORT}"
+echo -e "   [账密明细] 账号: ${SOCKS5_USER} | 密码: ${SOCKS5_PASS} \vert{} 端口: ${SOCKS5_PORT}"
 echo -e "⚠️  \033[1;31m使用提示（至关重要）:\033[0m"
 echo -e "   SOCKS5 为\033[31m明文传输协议\033[0m，严禁国内宽带直接裸连！"
 echo -e "   请务必在软路由（OpenWrt/ShellCrash/sing-box）的\033[32m“链式代理”\033[0m中使用，"
@@ -501,7 +516,7 @@ echo -e "\033[34m---------------------------------------------------------------
 echo -e "🛡️  \033[1;34m协议二：Shadowsocks 代理（支持小火箭直连 / 软路由直连）\033[0m"
 echo -e "------------------------------------------------------------------------"
 echo -e "🔗 一键导入链接: \033[36m${SS_LINK}\033[0m"
-echo -e "   [配置明细] 加密: aes-256-gcm | 密码: ${SS_PASS} | 端口: ${SS_PORT}"
+echo -e "   [配置明细] 加密: aes-256-gcm | 密码: ${SS_PASS} \vert{} 端口: ${SS_PORT}"
 echo -e "✨ \033[1;32m使用提示:\033[0m"
 echo -e "   Shadowsocks 自带\033[32m高强度军工级加密\033[0m，具备优秀的抗审查与抗嗅探能力。"
 echo -e "   支持直接复制上方链接，一键导入至 \033[36mShadowrocket（小火箭）、Clash、v2rayN、sing-box\033[0m 客户端；"
@@ -511,5 +526,5 @@ echo -e "\033[35m---------------------------------------------------------------
 echo -e "💡 \033[1;35m日常维护提示:\033[0m"
 echo -e "------------------------------------------------------------------------"
 echo -e "1. 随时查看上述连接信息可运行命令: \033[33mcat /opt/vpngate_info.txt\033[0m"
-echo -e "2. 请确保云服务器后台安全组（Ingress Rules）已放行 TCP: \033[36m${PANEL_PORT}, ${SOCKS5_PORT}, ${SS_PORT}\033[0m"
+echo -e "2. 请确保云服务器后台安全组（Ingress Rules）已放行 TCP: \033[36m${PANEL_PORT}, ${SOCKS5_PORT},${SS_PORT}\033[0m"
 echo -e "\033[32m========================================================================\033[0m\n"
