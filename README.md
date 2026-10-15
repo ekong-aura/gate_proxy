@@ -37,11 +37,7 @@ bash <(curl -fsSL [https://ghproxy.net/https://raw.githubusercontent.com/ekong-a
 cat /opt/vpngate_info.txt
 ```
 
-### 3. 客户端与软路由使用方式
-- **Shadowsocks 客户端直接导入**：复制部署成功后输出的 `ss://...` 标准链接，直接粘贴导入至 Shadowrocket（小火箭）、Clash、v2rayN 等客户端即可使用。
-- **软路由链式代理（SOCKS5）**：在 OpenWrt / ShellCrash / sing-box 中添加该 SOCKS5 节点，并将“上游/前置节点”设为你的常用机场节点，实现加密穿透与家宽落地。
-
-### 4. 一键彻底卸载
+### 3. 一键彻底卸载
 如需清理全部组件、容器与路由规则，执行：
 ```bash
 bash <(curl -fsSL [https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/uninstall.sh](https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/uninstall.sh))
