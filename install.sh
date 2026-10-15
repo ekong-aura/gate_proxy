@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 
 # ================= 动态生成随机密码与端口 =================
 PANEL_PORT="5000"
@@ -17,12 +16,24 @@ echo -e "\033[36m========================================================\033[0m
 echo -e "\033[36m    🚀 VPN Gate 家宽落地与自动化面板 一键部署程序       \033[0m"
 echo -e "\033[36m========================================================\033[0m"
 
-echo -e "\033[32m[1/6] 正在安装基础系统组件与 Docker 运行环境...\033[0m"
+echo -e "\033[32m[1/6] 正在配置系统源并安装基础组件与 Docker 环境...\033[0m"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y >/dev/null 2>&1
-apt-get install -y openvpn python3 python3-flask python3-requests docker.io curl iproute2 iptables >/dev/null 2>&1
 
-systemctl enable --now docker >/dev/null 2>&1
+# 针对 Ubuntu 24.04 等系统，开启 universe 源以支持 python3-flask
+apt-get install -y software-properties-common >/dev/null 2>&1 || true
+add-apt-repository -y universe >/dev/null 2>&1 || true
+
+apt-get update -y >/dev/null 2>&1 || true
+apt-get install -y openvpn python3 python3-flask python3-requests docker.io curl iproute2 iptables >/dev/null 2>&1 || {
+    echo -e "\033[33m检测到后台锁或依赖冲突，正在重试安装...\033[0m"
+    killall apt apt-get 2>/dev/null || true
+    rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || true
+    dpkg --configure -a >/dev/null 2>&1 || true
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y openvpn python3 python3-flask python3-requests docker.io curl iproute2 iptables
+}
+
+systemctl enable --now docker >/dev/null 2>&1 || systemctl restart docker >/dev/null 2>&1 || true
 
 echo -e "\033[32m[2/6] 配置策略路由与守护规则 (/opt/up.sh)...\033[0m"
 cat << 'EOF_UP' > /opt/up.sh
@@ -448,11 +459,11 @@ iptables -I INPUT -p tcp --dport ${SOCKS5_PORT} -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p tcp --dport ${SS_PORT} -j ACCEPT 2>/dev/null || true
 
 # 获取公网 IP
-SERVER_IP=$(curl -s4 https://api.ipify.org || curl -s4 https://ip.sb || curl -s4 https://ifconfig.me || echo "你的VPS公网IP")
+SERVER_IP=$(curl -s4 https://api.ipify.org || curl -s4 https://ip.sb || curl -s4 https://ifconfig.me || echo "168.107.82.116")
 
 # 生成 Shadowsocks 的标准 Base64 链接
 SS_RAW="aes-256-gcm:${SS_PASS}"
-SS_BASE64=$(echo -n "${SS_RAW}" \vert{} base64 -w 0 2>/dev/null \vert{}\vert{} echo -n "${SS_RAW}" | base64)
+SS_BASE64=$(echo -n "${SS_RAW}" | base64 | tr -d '\n')
 SS_LINK="ss://${SS_BASE64}@${SERVER_IP}:${SS_PORT}#VPN-Gate家宽落地"
 SOCKS5_LINK="socks5://${SOCKS5_USER}:${SOCKS5_PASS}@${SERVER_IP}:${SOCKS5_PORT}#VPN-Gate家宽落地"
 
