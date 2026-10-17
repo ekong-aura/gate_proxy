@@ -23,12 +23,7 @@
 ### 1. 一键安装部署
 在 VPS 终端执行以下单行命令：
 ```bash
-bash <(curl -fsSL [https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.sh](https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.sh))
-```
-
-**备用加速通道（若遇 GitHub 连接超时使用）**：
-```bash
-bash <(curl -fsSL [https://ghproxy.net/https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.sh](https://ghproxy.net/https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.sh))
+curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.sh | bash
 ```
 
 ### 2. 查看已生成的代理与账密信息
@@ -40,5 +35,5 @@ cat /opt/vpngate_info.txt
 ### 3. 一键彻底卸载
 如需清理全部组件、容器与路由规则，执行：
 ```bash
-bash <(curl -fsSL [https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/uninstall.sh](https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/uninstall.sh))
+curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/uninstall.sh | bash
 ```
