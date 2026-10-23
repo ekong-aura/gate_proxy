@@ -16,7 +16,7 @@ echo -e "\033[36m========================================================\033[0m
 echo -e "\033[36m    🚀 VPN Gate 家宽落地与自动化面板 一键部署程序       \033[0m"
 echo -e "\033[36m========================================================\033[0m"
 
-echo -e "\033[32m[1/6] 正在配置系统环境并安装依赖组件...\033[0m"
+echo -e "\033[32m[1/6] 正在配置系统源、智能升级 OpenVPN 并安装核心组件...\033[0m"
 export DEBIAN_FRONTEND=noninteractive
 
 # 解除可能的后台锁
@@ -25,9 +25,17 @@ rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2
 dpkg --configure -a >/dev/null 2>&1 || true
 
 apt-get update -y >/dev/null 2>&1 || true
-apt-get install -y software-properties-common curl iproute2 iptables >/dev/null 2>&1 || true
+apt-get install -y software-properties-common curl iproute2 iptables gnupg >/dev/null 2>&1 || true
 add-apt-repository -y universe >/dev/null 2>&1 || true
-apt-get update -y >/dev/null 2>&1 || true
+
+# 智能识别 Ubuntu 20.04 (Focal)，自动引入 OpenVPN 官方 2.6 仓库彻底抹平代差
+if grep -q "focal" /etc/os-release 2>/dev/null; then
+    echo -e "\033[33m检测到 Ubuntu 20.04，正在自动无痛升级 OpenVPN 至 2.6 官方现代版...\033[0m"
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://swupdate.openvpn.net/repos/openvpn-repo-pkg-key.pub | gpg --dearmor --yes -o /etc/apt/keyrings/openvpn.gpg 2>/dev/null || true
+    echo "deb [signed-by=/etc/apt/keyrings/openvpn.gpg] https://build.openvpn.net/debian/openvpn/release/2.6 focal main" > /etc/apt/sources.list.d/openvpn.list
+    apt-get update -y >/dev/null 2>&1 || true
+fi
 
 # 安装核心依赖
 apt-get install -y openvpn python3 python3-flask python3-requests docker.io || {
@@ -134,14 +142,6 @@ def save_config():
 
 load_config()
 
-def get_openvpn_ver():
-    try:
-        out = subprocess.run(["openvpn", "--version"], capture_output=True, text=True).stdout
-        m = re.search(r"OpenVPN\s+(\d+)\.(\d+)", out)
-        if m: return int(m.group(1)), int(m.group(2))
-    except Exception: pass
-    return 2, 4
-
 def check_tun0_health():
     if subprocess.run(["ip", "link", "show", "tun0"], capture_output=True).returncode != 0:
         return False
@@ -153,48 +153,20 @@ def do_connect_node(nid):
     last_connect_time = time.time()
     if nid not in cached_nodes: return False
     
-    maj, min_v = get_openvpn_ver()
     raw_ovpn = base64.b64decode(cached_nodes[nid]).decode("utf-8", "ignore")
-    
-    # 基础安全头（绝不污染系统主路由）
     headers = [
         "route-nopull",
         "route-noexec",
         "auth-user-pass " + AUTH_FILE,
         "auth-retry nointeract",
         "script-security 2",
-        "up /opt/up.sh"
+        "up /opt/up.sh",
+        "tls-cert-profile insecure",
+        "data-ciphers AES-128-CBC:AES-256-CBC:AES-128-GCM:AES-256-GCM",
+        "data-ciphers-fallback AES-128-CBC"
     ]
     
-    cleaned_lines = []
-    if (maj, min_v) >= (2, 6):
-        headers.extend([
-            "tls-cert-profile insecure",
-            "data-ciphers AES-128-CBC:AES-256-CBC:AES-128-GCM:AES-256-GCM",
-            "data-ciphers-fallback AES-128-CBC"
-        ])
-        cleaned_lines = raw_ovpn.splitlines()
-    elif (maj, min_v) == (2, 5):
-        headers.extend([
-            "data-ciphers AES-128-CBC:AES-256-CBC:AES-128-GCM:AES-256-GCM",
-            "data-ciphers-fallback AES-128-CBC"
-        ])
-        cleaned_lines = raw_ovpn.splitlines()
-    else:
-        # 针对 OpenVPN 2.4.x（如 Ubuntu 20.04）进行深度清洗
-        headers.extend([
-            "ignore-unknown-option data-ciphers data-ciphers-fallback tls-cert-profile",
-            "cipher AES-128-CBC",
-            "ncp-ciphers AES-128-GCM:AES-256-GCM:AES-128-CBC:AES-256-CBC"
-        ])
-        # 彻底剔除原始配置中导致 2.4 崩溃的第 104 行 data-ciphers 等新语法
-        for line in raw_ovpn.splitlines():
-            s = line.strip()
-            if re.match(r'^(data-ciphers|data-ciphers-fallback|tls-cert-profile)\b', s, re.IGNORECASE):
-                continue
-            cleaned_lines.append(line)
-            
-    final_ovpn = "\n".join(headers) + "\n" + "\n".join(cleaned_lines)
+    final_ovpn = "\n".join(headers) + "\n" + raw_ovpn
     with open(ACTIVE_OVPN, "w") as f:
         f.write(final_ovpn)
         
@@ -620,7 +592,7 @@ echo -e "\n\033[32m=============================================================
 echo -e "\033[32m🎉 恭喜！VPN Gate 家宽落地代理及可视化控制面板已成功部署！\033[0m"
 echo -e "\033[32m========================================================================\033[0m"
 echo -e "🌐 \033[1;37m可视化控制面板:\033[0m \033[36mhttp://${SERVER_IP}:${PANEL_PORT}\033[0m"
-echo -e "   (内置全版本 OpenVPN 自适应清洗引擎、自愈守护与双模切换机制)\n"
+echo -e "   (已完成多系统兼容：支持 Ubuntu 20.04/22.04/24.04 与 Debian 11/12 全自动部署)\n"
 echo -e "\033[33m------------------------------------------------------------------------\033[0m"
 echo -e "📦 \033[1;33m协议一：SOCKS5 代理（专用于软路由链式代理）\033[0m"
 echo -e "------------------------------------------------------------------------"
