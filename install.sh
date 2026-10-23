@@ -46,7 +46,7 @@ cat << 'EOF_UP' > /opt/up.sh
 #!/bin/bash
 ip route flush table 100 2>/dev/null || true
 while ip rule del table 100 2>/dev/null; do :; done
-ip route replace default via $route_vpn_gateway dev$dev table 100
+ip route replace default via $route_vpn_gateway dev $dev table 100
 ip rule add from $ifconfig_local table 100
 docker restart vpngate-proxy >/dev/null 2>&1 &
 exit 0
@@ -80,7 +80,6 @@ CONFIG_FILE = "/opt/vpngate_auto.json"
 cached_nodes, node_list_cache = {}, []
 last_connect_time = 0
 
-# 默认配置：新增 mode 控制字段 ("auto" 或 "manual")
 auto_cfg = {
     "mode": "auto",
     "p1": "JP",
@@ -106,6 +105,17 @@ def save_config():
     except Exception: pass
 
 load_config()
+
+def get_openvpn_ver():
+    """动态获取系统安装的 OpenVPN 主次版本号"""
+    try:
+        out = subprocess.run(["openvpn", "--version"], capture_output=True, text=True).stdout
+        m = re.search(r"OpenVPN\s+(\d+)\.(\d+)", out)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return 2, 4
 
 def check_node_alive(ip, port, proto="udp"):
     if proto.lower() == "tcp":
@@ -135,18 +145,33 @@ def do_connect_node(nid):
     subprocess.run(["pkill", "-9", "-f", "openvpn"])
     subprocess.run(["ip", "link", "delete", "tun0"], capture_output=True)
     time.sleep(1)
-    subprocess.Popen([
+
+    cmd = [
         "openvpn", "--config", ACTIVE_OVPN, "--dev", "tun0", "--route-noexec",
-        "--data-ciphers", "AES-128-CBC:AES-256-GCM", "--data-ciphers-fallback", "AES-128-CBC",
         "--script-security", "2", "--up", "/opt/up.sh", "--daemon"
-    ])
+    ]
+    # 根据 OpenVPN 版本动态适配加密参数
+    maj, min_v = get_openvpn_ver()
+    if (maj, min_v) >= (2, 5):
+        # OpenVPN 2.5 / 2.6 (Ubuntu 22.04/24.04, Debian 11/12)
+        cmd.extend([
+            "--data-ciphers", "AES-128-CBC:AES-256-GCM",
+            "--data-ciphers-fallback", "AES-128-CBC"
+        ])
+    else:
+        # OpenVPN 2.4 (如 Ubuntu 20.04)
+        cmd.extend([
+            "--cipher", "AES-128-CBC",
+            "--ncp-ciphers", "AES-128-CBC:AES-256-GCM"
+        ])
+
+    subprocess.Popen(cmd)
     return True
 
 def watchdog_thread():
     global auto_cfg
     while True:
         time.sleep(auto_cfg.get("interval", 30))
-        # 如果是手动模式，看门狗保持静默，绝不自动跨国切线
         if auto_cfg.get("mode", "auto") == "manual":
             auto_cfg["status_msg"] = "📌 手动锁定模式中，自动切线已暂停 (完全听从手动控制)"
             continue
@@ -247,7 +272,6 @@ th{background:#f8fafc;color:#4a5568}
 <div class="status">
   <div><span id="st">出口状态检测中...</span></div>
   <div style="display:flex;align-items:center;gap:12px;">
-    <!-- 核心模式切换胶囊按钮 -->
     <button id="btn-mode" class="mode-btn mode-auto" onclick="toggleMode()">🟢 模式：自动保活 (点击切为手动)</button>
     <span style="font-size:12px;color:#4a5568">每 10 秒同步</span>
   </div>
@@ -490,7 +514,6 @@ def get_nodes():
 def connect():
     nid = (request.get_json() or {}).get("id")
     if do_connect_node(nid):
-        # 核心改动：用户主动点击连接，立即自动转入【手动模式】，锁定当前选择
         auto_cfg["mode"] = "manual"
         auto_cfg["status_msg"] = f"📌 已手动连接节点 {nid}，模式自动切换为手动锁定"
         save_config()
@@ -533,7 +556,7 @@ SERVER_IP=$(curl -s4 https://api.ipify.org || curl -s4 https://ip.sb || curl -s4
 # 生成 Shadowsocks 的标准 Base64 链接
 SS_RAW="aes-256-gcm:${SS_PASS}"
 SS_BASE64=$(echo -n "${SS_RAW}" | base64 | tr -d '\n')
-SS_LINK="ss://${SS_BASE64}@${SERVER_IP}:${SS_PORT}#VPN-Gate家宽落地"
+SS_LINK="ss://${SS_BASE64}@${SERVER_IP}:${SS_PORT}#🌐 VPN-Gate | 动态家宽出口"
 SOCKS5_LINK="socks5://${SOCKS5_USER}:${SOCKS5_PASS}@${SERVER_IP}:${SOCKS5_PORT}#VPN-Gate家宽落地"
 
 # 将配置留底保存至本地文件
@@ -569,7 +592,7 @@ echo -e "\033[33m---------------------------------------------------------------
 echo -e "📦 \033[1;33m协议一：SOCKS5 代理（专用于软路由链式代理）\033[0m"
 echo -e "------------------------------------------------------------------------"
 echo -e "🔗 节点链接: \033[33m${SOCKS5_LINK}\033[0m"
-echo -e "   [账密明细] 账号: ${SOCKS5_USER} | 密码: ${SOCKS5_PASS} \vert{} 端口: ${SOCKS5_PORT}"
+echo -e "   [账密明细] 账号: ${SOCKS5_USER} | 密码: ${SOCKS5_PASS} | 端口: ${SOCKS5_PORT}"
 echo -e "⚠️  \033[1;31m使用提示（至关重要）:\033[0m"
 echo -e "   SOCKS5 为\033[31m明文传输协议\033[0m，严禁国内宽带直接裸连！"
 echo -e "   请务必在软路由（OpenWrt/ShellCrash/sing-box）的\033[32m“链式代理”\033[0m中使用，"
@@ -579,7 +602,7 @@ echo -e "\033[34m---------------------------------------------------------------
 echo -e "🛡️  \033[1;34m协议二：Shadowsocks 代理（支持小火箭直连 / 软路由直连）\033[0m"
 echo -e "------------------------------------------------------------------------"
 echo -e "🔗 一键导入链接: \033[36m${SS_LINK}\033[0m"
-echo -e "   [配置明细] 加密: aes-256-gcm | 密码: ${SS_PASS} \vert{} 端口: ${SS_PORT}"
+echo -e "   [配置明细] 加密: aes-256-gcm | 密码: ${SS_PASS} | 端口: ${SS_PORT}"
 echo -e "✨ \033[1;32m使用提示:\033[0m"
 echo -e "   Shadowsocks 自带\033[32m高强度军工级加密\033[0m，具备优秀的抗审查与抗嗅探能力。"
 echo -e "   支持直接复制上方链接，一键导入至 \033[36mShadowrocket（小火箭）、Clash、v2rayN、sing-box\033[0m 客户端；"
@@ -589,5 +612,5 @@ echo -e "\033[35m---------------------------------------------------------------
 echo -e "💡 \033[1;35m日常维护提示:\033[0m"
 echo -e "------------------------------------------------------------------------"
 echo -e "1. 随时查看上述连接信息可运行命令: \033[33mcat /opt/vpngate_info.txt\033[0m"
-echo -e "2. 请确保云服务器后台安全组（Ingress Rules）已放行 TCP: \033[36m${PANEL_PORT}, ${SOCKS5_PORT},${SS_PORT}\033[0m"
+echo -e "2. 请确保云服务器后台安全组（Ingress Rules）已放行 TCP: \033[36m${PANEL_PORT}, ${SOCKS5_PORT}, ${SS_PORT}\033[0m"
 echo -e "\033[32m========================================================================\033[0m\n"
