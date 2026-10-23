@@ -16,30 +16,45 @@ echo -e "\033[36m========================================================\033[0m
 echo -e "\033[36m    🚀 VPN Gate 家宽落地与自动化面板 一键部署程序       \033[0m"
 echo -e "\033[36m========================================================\033[0m"
 
-echo -e "\033[32m[1/6] 正在配置系统源并安装基础组件与 Docker 环境...\033[0m"
+echo -e "\033[32m[1/6] 正在配置系统源、升级 OpenVPN 并安装核心组件...\033[0m"
 export DEBIAN_FRONTEND=noninteractive
-
-# 修复 Ubuntu 24.04 / Debian 软件源，确保包含 python3-flask
-apt-get install -y software-properties-common >/dev/null 2>&1 || true
-add-apt-repository -y universe >/dev/null 2>&1 || true
 
 # 解除可能的后台锁
 killall apt apt-get 2>/dev/null || true
 rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || true
 dpkg --configure -a >/dev/null 2>&1 || true
 
-apt-get update -y
+# 修复软件源并尝试引入 OpenVPN 官方 PPA，确保升级到 OpenVPN 2.5/2.6+
+apt-get update -y >/dev/null 2>&1 || true
+apt-get install -y software-properties-common curl iproute2 iptables >/dev/null 2>&1 || true
+add-apt-repository -y universe >/dev/null 2>&1 || true
+add-apt-repository -y ppa:openvpn/stable >/dev/null 2>&1 || true
+apt-get update -y >/dev/null 2>&1 || true
 
-# 优先安装核心组件，避免包冲突阻断后续步骤
-apt-get install -y openvpn python3 python3-flask python3-requests curl iproute2 iptables
+# 安装核心组件
+apt-get install -y openvpn python3 python3-flask python3-requests docker.io || {
+    apt-get install -y openvpn python3 python3-flask python3-requests
+}
 
-# 智能识别 Docker：系统未安装时才安装 docker.io，避免与已有 containerd.io 冲突
-if ! command -v docker &> /dev/null; then
-    echo -e "\033[33m系统未检测到 Docker，正在自动安装...\033[0m"
-    apt-get install -y docker.io || true
+# 确保 TUN 字符设备存在（防止精简版 VPS 内核未加载 TUN）
+if [ ! -c /dev/net/tun ]; then
+    mkdir -p /dev/net
+    mknod /dev/net/tun c 10 200 2>/dev/null || true
+    chmod 666 /dev/net/tun 2>/dev/null || true
 fi
 
+# 智能识别 Docker
+if ! command -v docker &> /dev/null; then
+    apt-get install -y docker.io || true
+fi
 systemctl enable --now docker >/dev/null 2>&1 || systemctl restart docker >/dev/null 2>&1 || true
+
+# 准备 VPN Gate 全球通用认证凭据文件（防止 OpenVPN 等待交互密码而自杀）
+cat << 'EOF_AUTH' > /opt/vpngate_auth.txt
+vpn
+vpn
+EOF_AUTH
+chmod 600 /opt/vpngate_auth.txt
 
 echo -e "\033[32m[2/6] 配置策略路由与守护规则 (/opt/up.sh)...\033[0m"
 cat << 'EOF_UP' > /opt/up.sh
@@ -65,7 +80,7 @@ docker run -d --name vpngate-proxy \
 echo -e "\033[32m[4/6] 同步 VPN Gate 官方节点缓存...\033[0m"
 curl -sL -m 15 "https://www.vpngate.net/api/iphone/" -o /opt/vpngate_cache.csv || touch /opt/vpngate_cache.csv
 
-echo -e "\033[32m[5/6] 部署 Web 控制面板与后台看门狗 (Port: ${PANEL_PORT})...\033[0m"
+echo -e "\033[32m[5/6] 部署 Web 控制面板与自愈看门狗 (Port: ${PANEL_PORT})...\033[0m"
 cat << 'EOF_PY' > /opt/vpngate_panel.py
 import os, sys, time, json, math, base64, subprocess, threading, re, socket, urllib.request, csv, io, concurrent.futures
 from flask import Flask, jsonify, render_template_string, request
@@ -76,6 +91,8 @@ app = Flask(__name__)
 CACHE_FILE = "/opt/vpngate_cache.csv"
 ACTIVE_OVPN = "/tmp/vpngate_current.ovpn"
 CONFIG_FILE = "/opt/vpngate_auto.json"
+AUTH_FILE = "/opt/vpngate_auth.txt"
+OVPN_LOG = "/var/log/openvpn_vpngate.log"
 
 cached_nodes, node_list_cache = {}, []
 last_connect_time = 0
@@ -106,102 +123,83 @@ def save_config():
 
 load_config()
 
-def get_openvpn_ver():
-    """动态获取系统安装的 OpenVPN 主次版本号"""
-    try:
-        out = subprocess.run(["openvpn", "--version"], capture_output=True, text=True).stdout
-        m = re.search(r"OpenVPN\s+(\d+)\.(\d+)", out)
-        if m:
-            return int(m.group(1)), int(m.group(2))
-    except Exception:
-        pass
-    return 2, 4
-
-def check_node_alive(ip, port, proto="udp"):
-    if proto.lower() == "tcp":
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.8)
-            res = s.connect_ex((ip, int(port)))
-            s.close()
-            return res == 0
-        except Exception: return False
-    else:
-        res = subprocess.run(["ping", "-c", "1", "-W", "1", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return res.returncode == 0
-
 def check_tun0_health():
     if subprocess.run(["ip", "link", "show", "tun0"], capture_output=True).returncode != 0:
         return False
-    res = subprocess.run(["curl", "--interface", "tun0", "-m", "3", "-s", "-o", "/dev/null", "-w", "%{http_code}", "http://connectivitycheck.gstatic.com/generate_204"], capture_output=True, text=True)
+    res = subprocess.run(["curl", "--interface", "tun0", "-m", "4", "-s", "-o", "/dev/null", "-w", "%{http_code}", "http://connectivitycheck.gstatic.com/generate_204"], capture_output=True, text=True)
     return res.stdout.strip() in ["204", "200"]
 
 def do_connect_node(nid):
     global last_connect_time
     last_connect_time = time.time()
     if nid not in cached_nodes: return False
-    ovpn_content = "route-nopull\nroute-noexec\n" + base64.b64decode(cached_nodes[nid]).decode("utf-8", "ignore")
+    
+    # 注入向下兼容参数：放宽 OpenSSL 3.0 对老旧弱签名证书的拦截，保护默认网关
+    headers = [
+        "route-nopull",
+        "route-noexec",
+        "tls-cert-profile insecure",
+        "tls-cipher DEFAULT:@SECLEVEL=0",
+        "data-ciphers AES-128-CBC:AES-256-CBC:AES-128-GCM:AES-256-GCM",
+        "data-ciphers-fallback AES-128-CBC",
+        "cipher AES-128-CBC",
+        "auth-user-pass " + AUTH_FILE,
+        "auth-retry nointeract"
+    ]
+    ovpn_content = "\n".join(headers) + "\n" + base64.b64decode(cached_nodes[nid]).decode("utf-8", "ignore")
     with open(ACTIVE_OVPN, "w") as f: f.write(ovpn_content)
+    
     subprocess.run(["pkill", "-9", "-f", "openvpn"])
     subprocess.run(["ip", "link", "delete", "tun0"], capture_output=True)
     time.sleep(1)
 
     cmd = [
         "openvpn", "--config", ACTIVE_OVPN, "--dev", "tun0", "--route-noexec",
-        "--script-security", "2", "--up", "/opt/up.sh", "--daemon"
+        "--script-security", "2", "--up", "/opt/up.sh",
+        "--log", OVPN_LOG, "--daemon"
     ]
-    # 根据 OpenVPN 版本动态适配加密参数
-    maj, min_v = get_openvpn_ver()
-    if (maj, min_v) >= (2, 5):
-        # OpenVPN 2.5 / 2.6 (Ubuntu 22.04/24.04, Debian 11/12)
-        cmd.extend([
-            "--data-ciphers", "AES-128-CBC:AES-256-GCM",
-            "--data-ciphers-fallback", "AES-128-CBC"
-        ])
-    else:
-        # OpenVPN 2.4 (如 Ubuntu 20.04)
-        cmd.extend([
-            "--cipher", "AES-128-CBC",
-            "--ncp-ciphers", "AES-128-CBC:AES-256-GCM"
-        ])
-
     subprocess.Popen(cmd)
     return True
 
 def watchdog_thread():
     global auto_cfg
+    time.sleep(3) # 启动后短暂预热即开始首次自愈
     while True:
-        time.sleep(auto_cfg.get("interval", 30))
         if auto_cfg.get("mode", "auto") == "manual":
-            auto_cfg["status_msg"] = "📌 手动锁定模式中，自动切线已暂停 (完全听从手动控制)"
+            auto_cfg["status_msg"] = "📌 手动锁定模式中，自动切线已暂停"
+            time.sleep(auto_cfg.get("interval", 30))
             continue
-
-        if time.time() - last_connect_time < 35: continue
 
         auto_cfg["last_check"] = time.strftime("%H:%M:%S")
         if check_tun0_health():
             auto_cfg["status_msg"] = "网络健康，当前节点持续正常运行"
+            time.sleep(auto_cfg.get("interval", 30))
             continue
 
-        auto_cfg["status_msg"] = "⚠️ 检测到节点失效，正在按优先级自动重连..."
+        auto_cfg["status_msg"] = "⚠️ 检测到节点离线，正在按优先级自动重连..."
         priorities = [auto_cfg.get("p1", "JP"), auto_cfg.get("p2", "KR"), auto_cfg.get("p3", "US")]
         connected_success = False
+        
         for country in priorities:
             if country == "NONE": continue
             candidates = [n for n in node_list_cache if (country == "ALL" or n["country"] == country)]
             candidates.sort(key=lambda x: x["ping"])
-            for cand in candidates[:8]:
-                if check_node_alive(cand["ip"], cand["port"], cand["proto"]):
-                    auto_cfg["status_msg"] = f"正在故障转移至 {cand['country']} ({cand['ip']})..."
-                    do_connect_node(cand["id"])
-                    time.sleep(8)
-                    if check_tun0_health():
-                        auto_cfg["status_msg"] = f"✅ 已自动恢复连接至 {cand['country']} 节点 ({cand['ip']})"
-                        connected_success = True
-                        break
+            
+            # 依次尝试前 6 个优质候选节点进行直接拨号
+            for cand in candidates[:6]:
+                auto_cfg["status_msg"] = f"正在尝试连接 {cand['country']} ({cand['ip']})..."
+                do_connect_node(cand["id"])
+                time.sleep(9)
+                if check_tun0_health():
+                    auto_cfg["status_msg"] = f"✅ 已成功建立连接，当前落地: {cand['country']} ({cand['ip']})"
+                    connected_success = True
+                    break
             if connected_success: break
+            
         if not connected_success:
-            auto_cfg["status_msg"] = "❌ 自动重连完毕，暂无存活节点，等待下次检测"
+            auto_cfg["status_msg"] = "❌ 本轮重连未成功，等待下次巡检重试"
+            
+        time.sleep(auto_cfg.get("interval", 30))
 
 def parse_cache():
     global cached_nodes, node_list_cache
@@ -298,12 +296,12 @@ th{background:#f8fafc;color:#4a5568}
   <div class="filter-item">协议: <select id="proto" onchange="goPage(1)"><option value="ALL">全部协议</option><option value="UDP">仅 UDP</option><option value="TCP">仅 TCP</option></select></div>
   <div class="filter-item">排序: <select id="sort" onchange="goPage(1)"><option value="ping">最低延迟 (Ping)</option><option value="speed">最高带宽 (Speed)</option><option value="score">最高评分 (Score)</option></select></div>
   <div class="filter-item">每页: <select id="size" onchange="goPage(1)"><option value="15">15 条</option><option value="25" selected>25 条</option><option value="50">50 条</option></select></div>
-  <button onclick="loadNodes()">🔄 刷新当前页测活</button>
+  <button onclick="loadNodes()">🔄 刷新列表</button>
 </div>
 
 <table>
-  <thead><tr><th>国家/地区</th><th>IP:端口</th><th>协议</th><th>Ping</th><th>带宽</th><th>存活状态</th><th>操作</th></tr></thead>
-  <tbody id="tb"><tr><td colspan=7>加载中...</td></tr></tbody>
+  <thead><tr><th>国家/地区</th><th>IP:端口</th><th>协议</th><th>Ping</th><th>带宽</th><th>操作</th></tr></thead>
+  <tbody id="tb"><tr><td colspan=6>加载中...</td></tr></tbody>
 </table>
 
 <div class="pagination">
@@ -385,7 +383,7 @@ function loadNodes(){
   let proto = document.getElementById("proto").value;
   let sort = document.getElementById("sort").value;
   let size = document.getElementById("size").value;
-  document.getElementById("tb").innerHTML = "<tr><td colspan=7 style='text-align:center;'>正在多线程并发测活中，请稍候...</td></tr>";
+  document.getElementById("tb").innerHTML = "<tr><td colspan=6 style='text-align:center;'>正在读取节点列表...</td></tr>";
   fetch(`/api/nodes?country=${c}&proto=${proto}&sort=${sort}&page=${currentPage}&size=${size}`).then(r=>r.json()).then(data=>{
     currentPage = data.page; totalPages = data.total_pages || 1;
     document.getElementById("page-info").innerText = `第 ${data.page} 页 / 共 ${totalPages} 页 (符合筛选: ${data.total} 个)`;
@@ -393,11 +391,10 @@ function loadNodes(){
     document.getElementById("btn-next").disabled = (currentPage >= totalPages);
     let h = "";
     data.nodes.forEach(n=>{
-      let st = n.online ? '<span class="badge-online">🟢 响应正常</span>' : '<span class="badge-offline">🔴 无响应</span>';
-      let btn = `<button class="${n.online?'':'gray'}" onclick="conn('${n.id}')">连接</button>`;
-      h += `<tr><td>${n.country_long} (${n.country})</td><td>${n.ip}:${n.port}</td><td><b>${n.proto}</b></td><td>${n.ping}ms</td><td>${n.speed}Mbps</td><td>${st}</td><td>${btn}</td></tr>`;
+      let btn = `<button onclick="conn('${n.id}')">连接此节点</button>`;
+      h += `<tr><td>${n.country_long} (${n.country})</td><td>${n.ip}:${n.port}</td><td><b>${n.proto}</b></td><td>${n.ping}ms</td><td>${n.speed}Mbps</td><td>${btn}</td></tr>`;
     });
-    document.getElementById("tb").innerHTML = h || "<tr><td colspan=7 style='text-align:center;'>该筛选条件下暂无节点</td></tr>";
+    document.getElementById("tb").innerHTML = h || "<tr><td colspan=6 style='text-align:center;'>该筛选条件下暂无节点</td></tr>";
   });
 }
 
@@ -405,7 +402,7 @@ function goPage(p){ currentPage = p; loadNodes(); }
 function changePage(delta){ let target = currentPage + delta; if(target >= 1 && target <= totalPages){ currentPage = target; loadNodes(); } }
 function updateCache(){
   let btn = document.getElementById("btn-sync");
-  btn.disabled = true; btn.innerText = "⏳ 正在下载最新官方节点池...";
+  btn.disabled = true; btn.innerText = "⏳ 正在同步最新官方节点池...";
   fetch("/api/refresh_cache", {method:"POST"}).then(r=>r.json()).then(res=>{
     alert(res.msg); btn.disabled = false; btn.innerText = "📥 更新官方节点库";
     loadCountriesAndPriorities(); goPage(1);
@@ -413,7 +410,7 @@ function updateCache(){
 }
 
 function conn(id){
-  document.getElementById("st").innerText = "正在连接 " + id + "，请等待8秒...";
+  document.getElementById("st").innerText = "正在连接 " + id + "，请等待 8 秒...";
   fetch("/api/connect", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({id: id})})
     .then(r=>r.json()).then(d=>{
       renderModeBtn("manual");
@@ -431,7 +428,7 @@ def index(): return render_template_string(HTML)
 @app.route("/api/status")
 def status():
     if subprocess.run(["ip", "link", "show", "tun0"], capture_output=True).returncode != 0: return jsonify({"ip": None})
-    res = subprocess.run(["curl", "--interface", "tun0", "-m", "3", "-s", "https://ipinfo.io/json"], capture_output=True, text=True)
+    res = subprocess.run(["curl", "--interface", "tun0", "-m", "4", "-s", "https://ipinfo.io/json"], capture_output=True, text=True)
     return (res.stdout, 200, {"Content-Type": "application/json"}) if res.returncode == 0 and res.stdout.strip() else jsonify({"ip": None})
 
 @app.route("/api/toggle_mode", methods=["POST"])
@@ -500,22 +497,14 @@ def get_nodes():
     total_pages = math.ceil(total / size) if total > 0 else 1
     page = max(1, min(page, total_pages))
     page_nodes = filtered[(page - 1) * size : page * size]
-
-    def test_node(n):
-        node_copy = dict(n)
-        node_copy["online"] = check_node_alive(n["ip"], n["port"], n["proto"].lower())
-        return node_copy
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(size, 40)) as executor:
-        checked_nodes = list(executor.map(test_node, page_nodes))
-    return jsonify({"total": total, "page": page, "page_size": size, "total_pages": total_pages, "nodes": checked_nodes})
+    return jsonify({"total": total, "page": page, "page_size": size, "total_pages": total_pages, "nodes": page_nodes})
 
 @app.route("/api/connect", methods=["POST"])
 def connect():
     nid = (request.get_json() or {}).get("id")
     if do_connect_node(nid):
         auto_cfg["mode"] = "manual"
-        auto_cfg["status_msg"] = f"📌 已手动连接节点 {nid}，模式自动切换为手动锁定"
+        auto_cfg["status_msg"] = f"📌 已手动发起连接节点 {nid}，模式锁定为手动"
         save_config()
         return jsonify({"msg": "已发起连接: " + nid, "mode": "manual"})
     return jsonify({"msg": "节点不存在"}), 400
@@ -559,7 +548,6 @@ SS_BASE64=$(echo -n "${SS_RAW}" | base64 | tr -d '\n')
 SS_LINK="ss://${SS_BASE64}@${SERVER_IP}:${SS_PORT}#🌐 VPN-Gate | 动态家宽出口"
 SOCKS5_LINK="socks5://${SOCKS5_USER}:${SOCKS5_PASS}@${SERVER_IP}:${SOCKS5_PORT}#VPN-Gate家宽落地"
 
-# 将配置留底保存至本地文件
 cat << EOF_INFO > /opt/vpngate_info.txt
 ========================================================
            VPN Gate 家宽落地节点信息清单
@@ -581,36 +569,24 @@ cat << EOF_INFO > /opt/vpngate_info.txt
 ========================================================
 EOF_INFO
 
-# 输出控制台提示与话术
 echo -e "\n\033[32m========================================================================\033[0m"
 echo -e "\033[32m🎉 恭喜！VPN Gate 家宽落地代理及可视化控制面板已成功部署！\033[0m"
 echo -e "\033[32m========================================================================\033[0m"
 echo -e "🌐 \033[1;37m可视化控制面板:\033[0m \033[36mhttp://${SERVER_IP}:${PANEL_PORT}\033[0m"
-echo -e "   (内置双模切换：支持一键切【手动锁定】与【自动保活】)\n"
-
+echo -e "   (内置 OpenSSL 3.0 兼容穿透、自愈守护与双模切换机制)\n"
 echo -e "\033[33m------------------------------------------------------------------------\033[0m"
 echo -e "📦 \033[1;33m协议一：SOCKS5 代理（专用于软路由链式代理）\033[0m"
 echo -e "------------------------------------------------------------------------"
 echo -e "🔗 节点链接: \033[33m${SOCKS5_LINK}\033[0m"
-echo -e "   [账密明细] 账号: ${SOCKS5_USER} | 密码: ${SOCKS5_PASS} | 端口: ${SOCKS5_PORT}"
-echo -e "⚠️  \033[1;31m使用提示（至关重要）:\033[0m"
-echo -e "   SOCKS5 为\033[31m明文传输协议\033[0m，严禁国内宽带直接裸连！"
-echo -e "   请务必在软路由（OpenWrt/ShellCrash/sing-box）的\033[32m“链式代理”\033[0m中使用，"
-echo -e "   将\033[36m“前置节点 / 上游”\033[0m设置为你的常用机场节点，以此实现加密穿透与家宽落地。\n"
-
+echo -e "   [账密明细] 账号: ${SOCKS5_USER} | 密码: ${SOCKS5_PASS} | 端口: ${SOCKS5_PORT}\n"
 echo -e "\033[34m------------------------------------------------------------------------\033[0m"
 echo -e "🛡️  \033[1;34m协议二：Shadowsocks 代理（支持小火箭直连 / 软路由直连）\033[0m"
 echo -e "------------------------------------------------------------------------"
 echo -e "🔗 一键导入链接: \033[36m${SS_LINK}\033[0m"
-echo -e "   [配置明细] 加密: aes-256-gcm | 密码: ${SS_PASS} | 端口: ${SS_PORT}"
-echo -e "✨ \033[1;32m使用提示:\033[0m"
-echo -e "   Shadowsocks 自带\033[32m高强度军工级加密\033[0m，具备优秀的抗审查与抗嗅探能力。"
-echo -e "   支持直接复制上方链接，一键导入至 \033[36mShadowrocket（小火箭）、Clash、v2rayN、sing-box\033[0m 客户端；"
-echo -e "   如果你的 VPS 直连线路稳定，在软路由里可直接设置“直连（DIRECT）”，省去前置机场。\n"
-
+echo -e "   [配置明细] 加密: aes-256-gcm | 密码: ${SS_PASS} | 端口: ${SS_PORT}\n"
 echo -e "\033[35m------------------------------------------------------------------------\033[0m"
 echo -e "💡 \033[1;35m日常维护提示:\033[0m"
 echo -e "------------------------------------------------------------------------"
-echo -e "1. 随时查看上述连接信息可运行命令: \033[33mcat /opt/vpngate_info.txt\033[0m"
-echo -e "2. 请确保云服务器后台安全组（Ingress Rules）已放行 TCP: \033[36m${PANEL_PORT}, ${SOCKS5_PORT}, ${SS_PORT}\033[0m"
+echo -e "1. 随时查看连接信息可运行命令: \033[33mcat /opt/vpngate_info.txt\033[0m"
+echo -e "2. 查看底层 OpenVPN 隧道实时运行日志: \033[33mtail -f /var/log/openvpn_vpngate.log\033[0m"
 echo -e "\033[32m========================================================================\033[0m\n"
