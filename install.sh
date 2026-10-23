@@ -16,7 +16,7 @@ echo -e "\033[36m========================================================\033[0m
 echo -e "\033[36m    🚀 VPN Gate 家宽落地与自动化面板 一键部署程序       \033[0m"
 echo -e "\033[36m========================================================\033[0m"
 
-echo -e "\033[32m[1/6] 正在配置系统源、准备 OpenVPN 与核心环境...\033[0m"
+echo -e "\033[32m[1/6] 正在配置系统环境并安装依赖组件...\033[0m"
 export DEBIAN_FRONTEND=noninteractive
 
 # 解除可能的后台锁
@@ -29,12 +29,12 @@ apt-get install -y software-properties-common curl iproute2 iptables >/dev/null 
 add-apt-repository -y universe >/dev/null 2>&1 || true
 apt-get update -y >/dev/null 2>&1 || true
 
-# 安装核心组件
+# 安装核心依赖
 apt-get install -y openvpn python3 python3-flask python3-requests docker.io || {
     apt-get install -y openvpn python3 python3-flask python3-requests
 }
 
-# 确保 TUN 字符设备存在（防止精简版 VPS 内核未加载 TUN）
+# 确保 TUN/TAP 设备在内核中就绪
 if [ ! -c /dev/net/tun ]; then
     mkdir -p /dev/net
     mknod /dev/net/tun c 10 200 2>/dev/null || true
@@ -47,12 +47,25 @@ if ! command -v docker &> /dev/null; then
 fi
 systemctl enable --now docker >/dev/null 2>&1 || systemctl restart docker >/dev/null 2>&1 || true
 
-# 准备 VPN Gate 全球通用认证凭据文件（防止 OpenVPN 等待交互密码而自杀）
+# 准备 VPN Gate 全球通用认证凭据文件
 cat << 'EOF_AUTH' > /opt/vpngate_auth.txt
 vpn
 vpn
 EOF_AUTH
 chmod 600 /opt/vpngate_auth.txt
+
+# 初始化自动看门狗配置文件
+cat << 'EOF_CFG' > /opt/vpngate_auto.json
+{
+  "mode": "auto",
+  "p1": "JP",
+  "p2": "KR",
+  "p3": "US",
+  "interval": 30,
+  "status_msg": "正在初始化自愈看门狗...",
+  "last_check": "尚未检测"
+}
+EOF_CFG
 
 echo -e "\033[32m[2/6] 配置策略路由与守护规则 (/opt/up.sh)...\033[0m"
 cat << 'EOF_UP' > /opt/up.sh
@@ -76,7 +89,7 @@ docker run -d --name vpngate-proxy \
   -L "ss://aes-256-gcm:${SS_PASS}@0.0.0.0:${SS_PORT}?interface=tun0" >/dev/null 2>&1
 
 echo -e "\033[32m[4/6] 同步 VPN Gate 官方节点缓存...\033[0m"
-curl -sL -m 15 "https://www.vpngate.net/api/iphone/" -o /opt/vpngate_cache.csv || touch /opt/vpngate_cache.csv
+curl -sL -m 20 "https://www.vpngate.net/api/iphone/" -o /opt/vpngate_cache.csv || touch /opt/vpngate_cache.csv
 
 echo -e "\033[32m[5/6] 部署 Web 控制面板与自愈看门狗 (Port: ${PANEL_PORT})...\033[0m"
 cat << 'EOF_PY' > /opt/vpngate_panel.py
@@ -141,40 +154,56 @@ def do_connect_node(nid):
     if nid not in cached_nodes: return False
     
     maj, min_v = get_openvpn_ver()
+    raw_ovpn = base64.b64decode(cached_nodes[nid]).decode("utf-8", "ignore")
+    
+    # 基础安全头（绝不污染系统主路由）
     headers = [
         "route-nopull",
         "route-noexec",
         "auth-user-pass " + AUTH_FILE,
         "auth-retry nointeract",
-        "cipher AES-128-CBC"
+        "script-security 2",
+        "up /opt/up.sh"
     ]
     
-    # 根据具体版本精准注入加密选项，彻底杜绝 2.4 报错
+    cleaned_lines = []
     if (maj, min_v) >= (2, 6):
         headers.extend([
             "tls-cert-profile insecure",
             "data-ciphers AES-128-CBC:AES-256-CBC:AES-128-GCM:AES-256-GCM",
             "data-ciphers-fallback AES-128-CBC"
         ])
+        cleaned_lines = raw_ovpn.splitlines()
     elif (maj, min_v) == (2, 5):
         headers.extend([
             "data-ciphers AES-128-CBC:AES-256-CBC:AES-128-GCM:AES-256-GCM",
             "data-ciphers-fallback AES-128-CBC"
         ])
+        cleaned_lines = raw_ovpn.splitlines()
     else:
-        # OpenVPN 2.4.x (如 2.4.12)
-        headers.append("ncp-ciphers AES-128-CBC:AES-256-GCM:AES-256-CBC")
+        # 针对 OpenVPN 2.4.x（如 Ubuntu 20.04）进行深度清洗
+        headers.extend([
+            "ignore-unknown-option data-ciphers data-ciphers-fallback tls-cert-profile",
+            "cipher AES-128-CBC",
+            "ncp-ciphers AES-128-GCM:AES-256-GCM:AES-128-CBC:AES-256-CBC"
+        ])
+        # 彻底剔除原始配置中导致 2.4 崩溃的第 104 行 data-ciphers 等新语法
+        for line in raw_ovpn.splitlines():
+            s = line.strip()
+            if re.match(r'^(data-ciphers|data-ciphers-fallback|tls-cert-profile)\b', s, re.IGNORECASE):
+                continue
+            cleaned_lines.append(line)
+            
+    final_ovpn = "\n".join(headers) + "\n" + "\n".join(cleaned_lines)
+    with open(ACTIVE_OVPN, "w") as f:
+        f.write(final_ovpn)
         
-    ovpn_content = "\n".join(headers) + "\n" + base64.b64decode(cached_nodes[nid]).decode("utf-8", "ignore")
-    with open(ACTIVE_OVPN, "w") as f: f.write(ovpn_content)
-    
     subprocess.run(["pkill", "-9", "-f", "openvpn"])
     subprocess.run(["ip", "link", "delete", "tun0"], capture_output=True)
     time.sleep(1)
 
     cmd = [
-        "openvpn", "--config", ACTIVE_OVPN, "--dev", "tun0", "--route-noexec",
-        "--script-security", "2", "--up", "/opt/up.sh",
+        "openvpn", "--config", ACTIVE_OVPN, "--dev", "tun0",
         "--log", OVPN_LOG, "--daemon"
     ]
     subprocess.Popen(cmd)
@@ -591,7 +620,7 @@ echo -e "\n\033[32m=============================================================
 echo -e "\033[32m🎉 恭喜！VPN Gate 家宽落地代理及可视化控制面板已成功部署！\033[0m"
 echo -e "\033[32m========================================================================\033[0m"
 echo -e "🌐 \033[1;37m可视化控制面板:\033[0m \033[36mhttp://${SERVER_IP}:${PANEL_PORT}\033[0m"
-echo -e "   (内置全版本 OpenVPN 自适应引擎、自愈守护与双模切换机制)\n"
+echo -e "   (内置全版本 OpenVPN 自适应清洗引擎、自愈守护与双模切换机制)\n"
 echo -e "\033[33m------------------------------------------------------------------------\033[0m"
 echo -e "📦 \033[1;33m协议一：SOCKS5 代理（专用于软路由链式代理）\033[0m"
 echo -e "------------------------------------------------------------------------"
