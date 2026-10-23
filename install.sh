@@ -16,7 +16,7 @@ echo -e "\033[36m========================================================\033[0m
 echo -e "\033[36m    🚀 VPN Gate 家宽落地与自动化面板 一键部署程序       \033[0m"
 echo -e "\033[36m========================================================\033[0m"
 
-echo -e "\033[32m[1/6] 正在配置系统源、升级 OpenVPN 并安装核心组件...\033[0m"
+echo -e "\033[32m[1/6] 正在配置系统源、准备 OpenVPN 与核心环境...\033[0m"
 export DEBIAN_FRONTEND=noninteractive
 
 # 解除可能的后台锁
@@ -24,11 +24,9 @@ killall apt apt-get 2>/dev/null || true
 rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || true
 dpkg --configure -a >/dev/null 2>&1 || true
 
-# 修复软件源并尝试引入 OpenVPN 官方 PPA，确保升级到 OpenVPN 2.5/2.6+
 apt-get update -y >/dev/null 2>&1 || true
 apt-get install -y software-properties-common curl iproute2 iptables >/dev/null 2>&1 || true
 add-apt-repository -y universe >/dev/null 2>&1 || true
-add-apt-repository -y ppa:openvpn/stable >/dev/null 2>&1 || true
 apt-get update -y >/dev/null 2>&1 || true
 
 # 安装核心组件
@@ -123,6 +121,14 @@ def save_config():
 
 load_config()
 
+def get_openvpn_ver():
+    try:
+        out = subprocess.run(["openvpn", "--version"], capture_output=True, text=True).stdout
+        m = re.search(r"OpenVPN\s+(\d+)\.(\d+)", out)
+        if m: return int(m.group(1)), int(m.group(2))
+    except Exception: pass
+    return 2, 4
+
 def check_tun0_health():
     if subprocess.run(["ip", "link", "show", "tun0"], capture_output=True).returncode != 0:
         return False
@@ -134,18 +140,31 @@ def do_connect_node(nid):
     last_connect_time = time.time()
     if nid not in cached_nodes: return False
     
-    # 注入向下兼容参数：放宽 OpenSSL 3.0 对老旧弱签名证书的拦截，保护默认网关
+    maj, min_v = get_openvpn_ver()
     headers = [
         "route-nopull",
         "route-noexec",
-        "tls-cert-profile insecure",
-        "tls-cipher DEFAULT:@SECLEVEL=0",
-        "data-ciphers AES-128-CBC:AES-256-CBC:AES-128-GCM:AES-256-GCM",
-        "data-ciphers-fallback AES-128-CBC",
-        "cipher AES-128-CBC",
         "auth-user-pass " + AUTH_FILE,
-        "auth-retry nointeract"
+        "auth-retry nointeract",
+        "cipher AES-128-CBC"
     ]
+    
+    # 根据具体版本精准注入加密选项，彻底杜绝 2.4 报错
+    if (maj, min_v) >= (2, 6):
+        headers.extend([
+            "tls-cert-profile insecure",
+            "data-ciphers AES-128-CBC:AES-256-CBC:AES-128-GCM:AES-256-GCM",
+            "data-ciphers-fallback AES-128-CBC"
+        ])
+    elif (maj, min_v) == (2, 5):
+        headers.extend([
+            "data-ciphers AES-128-CBC:AES-256-CBC:AES-128-GCM:AES-256-GCM",
+            "data-ciphers-fallback AES-128-CBC"
+        ])
+    else:
+        # OpenVPN 2.4.x (如 2.4.12)
+        headers.append("ncp-ciphers AES-128-CBC:AES-256-GCM:AES-256-CBC")
+        
     ovpn_content = "\n".join(headers) + "\n" + base64.b64decode(cached_nodes[nid]).decode("utf-8", "ignore")
     with open(ACTIVE_OVPN, "w") as f: f.write(ovpn_content)
     
@@ -163,7 +182,7 @@ def do_connect_node(nid):
 
 def watchdog_thread():
     global auto_cfg
-    time.sleep(3) # 启动后短暂预热即开始首次自愈
+    time.sleep(3)
     while True:
         if auto_cfg.get("mode", "auto") == "manual":
             auto_cfg["status_msg"] = "📌 手动锁定模式中，自动切线已暂停"
@@ -185,8 +204,7 @@ def watchdog_thread():
             candidates = [n for n in node_list_cache if (country == "ALL" or n["country"] == country)]
             candidates.sort(key=lambda x: x["ping"])
             
-            # 依次尝试前 6 个优质候选节点进行直接拨号
-            for cand in candidates[:6]:
+            for cand in candidates[:8]:
                 auto_cfg["status_msg"] = f"正在尝试连接 {cand['country']} ({cand['ip']})..."
                 do_connect_node(cand["id"])
                 time.sleep(9)
@@ -573,7 +591,7 @@ echo -e "\n\033[32m=============================================================
 echo -e "\033[32m🎉 恭喜！VPN Gate 家宽落地代理及可视化控制面板已成功部署！\033[0m"
 echo -e "\033[32m========================================================================\033[0m"
 echo -e "🌐 \033[1;37m可视化控制面板:\033[0m \033[36mhttp://${SERVER_IP}:${PANEL_PORT}\033[0m"
-echo -e "   (内置 OpenSSL 3.0 兼容穿透、自愈守护与双模切换机制)\n"
+echo -e "   (内置全版本 OpenVPN 自适应引擎、自愈守护与双模切换机制)\n"
 echo -e "\033[33m------------------------------------------------------------------------\033[0m"
 echo -e "📦 \033[1;33m协议一：SOCKS5 代理（专用于软路由链式代理）\033[0m"
 echo -e "------------------------------------------------------------------------"
