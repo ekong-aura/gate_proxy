@@ -65,6 +65,7 @@ step(){                          # $1="3/9"  $2=标题
   local idx="${1%%/*}"
   local pct=$(( idx * 100 / STEP_TOTAL ))
   [ "$pct" -gt 100 ] && pct=100
+  [ -t 1 ] && printf '\r\033[K'   # 清掉上一行可能残留的转圈文字
   echo
   printf '%s[%s]%s %3d%%  %s%s%s   %s(%ds)%s\n' \
     "$C" "$(bar_str "$pct")" "$N" "$pct" "$W" "$2" "$N" "$C" "$(( SECONDS - T0 ))" "$N"
@@ -118,16 +119,27 @@ SOCKS5_PASS=$(genpass 14)
 SS_PASS=$(genpass 18)
 PANEL_PASS=$(genpass 16)
 # SS2022 的密码必须是一段 base64 编码的 32 字节密钥（aes-256-gcm 用 32 字节）。
-# 避开 + 和 / 两个字符，否则塞进 ss:// 链接时部分客户端解析会出错。
-SS2022_PASS=""
-for _try in 1 2 3 4 5 6 7 8 9 10; do
-  SS2022_PASS=$(head -c 32 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '\n')
-  case "$SS2022_PASS" in
-    ""|*+*|*/*) continue ;;
-  esac
-  [ "${#SS2022_PASS}" -eq 44 ] && break
-done
-[ "${#SS2022_PASS}" -eq 44 ] || SS2022_PASS="ERERERERERERERERERERERERERERERERERERERERERA="
+# base64 会产出 + 和 /，而 / 在 URL 里是路径分隔符 —— 一旦密钥里带 /，
+# gost 的 ss:// 解析会失败（退化成 tcp 转发，把算法名当主机名去 DNS 解析），
+# 客户端解析 ss:// 链接也会切错。所以必须保证密钥只含 [A-Za-z0-9=]。
+ss2022_key(){
+  local k="" i
+  for i in $(seq 1 200); do
+    k=$(head -c 32 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '\n')
+    case "$k" in
+      ""|*+*|*/*) continue ;;
+    esac
+    [ "${#k}" -eq 44 ] && { printf '%s' "$k"; return 0; }
+  done
+  # 极端兜底：+ 和 / 换成同属 base64 字符集的 A/B，解码后依然是合法的 32 字节密钥
+  k=$(head -c 32 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '\n' | tr '+/' 'AB')
+  printf '%s' "$k"
+}
+SS2022_PASS=$(ss2022_key)
+# 最后再断言一次，任何情况下都不让带 + / 的密钥流出去
+case "$SS2022_PASS" in
+  ""|*+*|*/*) SS2022_PASS=$(head -c 32 /dev/urandom | base64 | tr -d '\n' | tr '+/' 'AB') ;;
+esac
 
 ARCH_RAW=$(uname -m)
 case "$ARCH_RAW" in
@@ -1910,12 +1922,12 @@ def build_endpoints():
         "出口在 %d 条隧道间轮询，速度叠加，但 IP 会变" % TUNNELS,
         "轮询 %d 条隧道" % TUNNELS)
 
-    ss_b64 = base64.b64encode(("aes-256-gcm:%s" % SS_PASS).encode()).decode()
+    ss_b64 = base64.urlsafe_b64encode(("aes-256-gcm:%s" % SS_PASS).encode()).decode().rstrip("=")
     add("ss", "Shadowsocks", "ss aes-256-gcm", SS_PORT,
         "ss://%s@%s:%d#VPN-Gate-SS" % (ss_b64, ip, SS_PORT), "",
         "老客户端兼容性最好", "TCP")
     if SS2022_PASS:
-        s22 = base64.b64encode(("2022-blake3-aes-256-gcm:%s" % SS2022_PASS).encode()).decode()
+        s22 = base64.urlsafe_b64encode(("2022-blake3-aes-256-gcm:%s" % SS2022_PASS).encode()).decode().rstrip("=")
         add("ss", "Shadowsocks 2022", "ss blake3-aes-256-gcm", SS2022_PORT,
             "ss://%s@%s:%d#VPN-Gate-SS2022" % (s22, ip, SS2022_PORT), "",
             "防重放，需要客户端支持 SS2022", "TCP")
@@ -3504,9 +3516,9 @@ command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/d
 SERVER_IP="$PUBLIC_IP"
 [ -n "$SERVER_IP" ] || { SERVER_IP="你的VPS公网IP"; warn "无法识别公网 IP，请自行替换"; }
 
-SS_B64=$(printf 'aes-256-gcm:%s' "$SS_PASS" | base64 | tr -d '\n')
+SS_B64=$(printf 'aes-256-gcm:%s' "$SS_PASS" | base64 | tr '+/' '-_' | tr -d '=\n')
 SS_LINK="ss://${SS_B64}@${SERVER_IP}:${SS_PORT}#VPN-Gate"
-SS22_B64=$(printf '2022-blake3-aes-256-gcm:%s' "$SS2022_PASS" | base64 | tr -d '\n')
+SS22_B64=$(printf '2022-blake3-aes-256-gcm:%s' "$SS2022_PASS" | base64 | tr '+/' '-_' | tr -d '=\n')
 SS22_LINK="ss://${SS22_B64}@${SERVER_IP}:${SS2022_PORT}#VPN-Gate-SS2022"
 SSU_LINK="ssu://2022-blake3-aes-256-gcm:${SS2022_PASS}@${SERVER_IP}:${SSU_PORT}"
 SOCKS_LINK="socks5://${PANEL_USER}:${SOCKS5_PASS}@${SERVER_IP}:${SOCKS5_PORT}#VPN-Gate"
