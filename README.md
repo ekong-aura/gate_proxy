@@ -3,6 +3,7 @@
 在海外 VPS 上一键搭建 **全球真实家庭宽带（住宅 IP）出口代理**。把 VPS 的流量中继到全球家宽的志愿者节点，用于流媒体、区域限制内容、账号环境一致性等场景，自带可视化管理面板与多隧道自愈守护。
 
 > **v3 · 多隧道聚合版**：N 条独立隧道并行 + gost 按连接轮询分流，等效带宽叠加；逐隧道独立自愈，单条掉线不影响业务；节点评分按实测分布标定，优先抢冷门节点。
+> 架构演进与缺陷审计见 [`FIXES.md`](FIXES.md)。
 
 ## 二、为什么这样设计（性能关键）
 
@@ -63,10 +64,10 @@ VPN Gate 节点的瓶颈**不是 IP 质量**（它们本身就是真实 ISP 住�
 | `/etc/systemd/system/vpngate*.service` | systemd 只认这个目录 |
 | `/etc/sysctl.d/99-vpngate.conf` | 内核参数开机加载位置 |
 
-想换目录的话（比如 `/data/gate_proxy`）：
+想换目录的话（比如 `/data/gate_proxy`），安装时带上环境变量即可：
 
 ```bash
-INSTALL_DIR=/data/gate_proxy bash install.sh
+curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.sh | INSTALL_DIR=/data/gate_proxy bash
 ```
 
 从旧版本升级时，会**自动把 `/opt` 下的缓存和节点池迁移过来**，池子不会丢。
@@ -226,59 +227,47 @@ Windows 的 Chrome 不渲染国旗 emoji（系统没有国旗字体），会显�
 - **端口**：云安全组放行 TCP `5000` `10808` `10809` `10810` `10818..10820`，以及 UDP `10811`
 - **依赖**：`openvpn`、`python3 ≥ 3.7`、`curl`、`iproute2`、`iptables`。gost 用静态二进制，不需要 Docker
 
-## 五、安装
+## 五、安装与卸载
 
-### 从旧版本升级（含最早的 v1）
-
-**不需要先卸载，直接跑新版的 `install.sh` 就行** —— 安装是幂等的，会在第一步自动清理旧残留：
-
-| 会自动清掉 | 说明 |
-|---|---|
-| 旧 systemd 单元 | `vpngate` / `vpngate-gost` / `vpngate-panel` / `vpngate-watchdog` |
-| 旧进程 | 面板、gost、以及 v1 遗留的 `/tmp/vpngate_current.ovpn` OpenVPN |
-| v1 的 docker 容器 | `vpngate-proxy` / `vpngate-socks5` / `vpngate-ss`（容器不删会一直占着 10808/10809） |
-| v1 的临时文件 | `/tmp/vpngate_current.ovpn`、`/tmp/vpngate_panel.log` |
-
-**如果想让机器更干净**，加 `CLEAN=1`，会额外删掉：
-
-- docker 镜像 `gogost/gost`（约 20MB，v1 下载的）
-- 下载缓存 `/tmp/gost_x`、`/tmp/gost.tgz` 等
-- 把 `openvpn_vpngate.log` 压缩到最近 2000 行
-- 清理旧的 tun 设备和策略路由表
-
-```bash
-CLEAN=1 bash install.sh
-```
-
-安装第一步就会打印清理了什么，例如：
-
-```
-[░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   0%  环境预检与旧版本清理   (0s)
-  ✔ 移除旧服务 vpngate.service
-  ✔ 结束 v1 遗留的 OpenVPN
-  ✔ 移除旧容器 vpngate-proxy
-  ✔ 删除 docker 镜像 gogost/gost
-  ✔ 共清理 4 项旧残留
-```
-
-### 彻底推倒重来（可选）
-
-想回到全新状态，先卸载再装：
-
-```bash
-PURGE=1 bash uninstall.sh    # PURGE=1 会一并删 docker 镜像和 v1 遗留的 python3-flask/requests
-bash install.sh
-```
-
-> 平时**不需要**这么做。`uninstall.sh` 只是给你一个"完全回到装机前"的手段，风险更大（会清路由规则和 sysctl）。
-
-### 一键安装
+### 安装
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.sh | bash
 ```
 
-结束时会逐条确认隧道并打印每条隧道的独立出口 IP。
+装完终端会打印面板地址、账号密码和全部接入链接，也可以随时查看：
+
+```bash
+cat /opt/gate_proxy/vpngate_info.txt
+```
+
+然后浏览器打开 `http://VPS_IP:5000` 登录。
+
+### 更新
+
+**重跑同一条安装命令就是更新** —— 脚本是幂等的：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.sh | bash
+```
+
+重跑会拉取最新版本、清掉旧版本残留、保留节点池和缓存，并重新生成密码（密码会变，记得重新看 info 文件）。
+
+### 卸载
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/uninstall.sh | bash
+```
+
+默认只删本项目自己的东西。两个可选参数是**装在命令上**的：
+
+```bash
+# 彻底清理：连 docker 镜像和旧版遗留的 python 包一起删
+curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/uninstall.sh | PURGE=1 bash
+
+# 保留节点池数据（以后重装还能接着用历史节点）
+curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/uninstall.sh | KEEP_DATA=1 bash
+```
 
 ### 环境变量
 
@@ -312,16 +301,16 @@ curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.
 
 ```bash
 # 想要更大带宽（4 核以上机器）
-TUNNELS=4 bash install.sh
+curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.sh | TUNNELS=4 bash
 
 # 冷门节点不够用时放宽
-SESSION_CAP=100 TUNNELS=3 bash install.sh
+curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.sh | SESSION_CAP=100 TUNNELS=3 bash
 
 # 谷歌云 / 高丢包
-FIX_MTU=1 MSSFIX=1240 bash install.sh
+curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.sh | FIX_MTU=1 MSSFIX=1240 bash
 
 # 机房封 UDP
-PREFER_TCP=1 bash install.sh
+curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/install.sh | PREFER_TCP=1 bash
 ```
 
 ## 六、不用开面板：`vg` 命令
@@ -447,7 +436,9 @@ JP 45   KR 26   RU 9   TH 4   HR 4   US 3   ID 2   IN/AE/RO/EG/NZ/PE 各 1
 > 美国节点从 3 个涨到 9 个，就是这么来的。不过要注意：历史节点可能已经下线，
 > 系统会先试在线节点，实在不够才用历史的，失败了会进黑名单。
 
-## 八、自动优选：节点会不会被优化**会，而且是三层筛选：**
+## 八、自动优选：节点会不会被优化
+
+**会，而且是三层筛选：**
 
 1. **选节点时**：按「当前并发人数 + 历史带宽 + 累计用户 + 实测 RTT」打分，不是随机挑。默认还会排除并发 >60 人的拥挤节点。
 2. **掉线重连时**：优先连回**上次那个节点**（保持 IP 稳定）；它真死了才重新从池子里挑最好的。
@@ -489,25 +480,20 @@ JP 45   KR 26   RU 9   TH 4   HR 4   US 3   ID 2   IN/AE/RO/EG/NZ/PE 各 1
 
 ## 十、日常使用
 
+大多数时候只用 `vg` 就够了（不开面板）：
+
 ```bash
-cat /opt/gate_proxy/vpngate_info.txt      # 账号与链接
-curl -s 127.0.0.1:5000/api/diag | python3 -m json.tool             # 运行态
-for i in 0 1 2; do ip -4 addr show tun$i | grep inet; done          # 各隧道地址
+vg                                        # 隧道/出口/带宽/优选状态一览
+cat /opt/gate_proxy/vpngate_info.txt      # 账号与全部接入链接
 tail -f /opt/gate_proxy/openvpn.log       # 隧道日志
-systemctl status vpngate vpngate-gost
+systemctl status vpngate vpngate-gost     # 服务状态
+for i in 0 1 2; do ip -4 addr show tun$i | grep inet; done   # 各隧道地址
 ```
 
-体检：
+体检脚本（装不装都不影响使用，出问题时跑一次）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/diag.sh -o diag.sh && bash diag.sh
-```
-
-卸载：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/uninstall.sh | bash
-# KEEP_LOG=1 保留日志；KEEP_SYSCTL=1 保留 BBR 配置
+curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/diag.sh | bash
 ```
 
 ## 十一、断线切换：能无感到什么程度
@@ -573,7 +559,7 @@ curl -fsSL https://raw.githubusercontent.com/ekong-aura/gate_proxy/main/uninstal
 |---|---|
 | 代理连不上、报「连接被拒绝 / Connection refused」 | ① 面板顶部横幅：本机是否在监听那个端口 ② 云安全组是否放行了**那个具体端口**（粘性口 10818~10820 要单独放行） ③ `ss -lntp \| grep 1080` |
 | 面板打不开 | 云防火墙放行了 5000 吗？`ss -lntp \| grep 5000` |
-| 面板 0 节点 | `bash diag.sh` 看「节点库质量」，或点「更新官方节点库」 |
+| 面板 0 节点 | 跑体检脚本看「节点库质量」，或点面板上的「更新官方节点库」 |
 | 链接里的 IP 是 `10.x` / `192.168.x` | 是内网地址，客户端当然连不上。新版会自动拒绝私有 IP 并重新探测；仍失败就把 `PUBLIC_IP=公网IP` 写进 systemd 单元 |
 | 只有 1 条隧道起来 | 正常，守护线程会逐条补齐；看状态文案 |
 | tun 在但打不开网页 | MTU。`MSSFIX=1240` 重装，或 `ip link set tun0 mtu 1300` 试 |
